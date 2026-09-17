@@ -1,0 +1,24 @@
+[project]
+name = "workright"
+version = "0.1.0"
+description = "Local AI HR agent for Malaysian leave and flexible work"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.0",
+    "fastapi>=0.141.1",
+    "ollama>=0.6.2",
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.5",
+    "sqlalchemy>=2.0.52",
+    "uvicorn>=0.52.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["backend"]

@@ -1,0 +1,44 @@
+# macOS and editor files
+.DS_Store
+._*
+.idea/
+.vscode/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Python environments, caches, and generated packages
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Frontend dependencies and generated output
+node_modules/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Local runtime data, logs, and model binaries
+.local/
+data/postgres/
+data/models/
+*.log
+*.pid
+*.gguf
+
+# Keep dependency lockfiles and knowledge documents versioned.
