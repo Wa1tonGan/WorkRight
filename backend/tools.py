@@ -1,0 +1,571 @@
+"""Agent tools — deterministic facts for the (future) LLM loop.
+
+Phase 1 rule of the house: the LLM may REQUEST a tool; only this code DECIDES.
+Every function here is plain Python + the database — no model, no chat, no
+framework. When the loop lands, it will call exactly these functions and
+nothing else.
+
+Two layers, deliberately separated:
+- pure calculators (completed_years, statutory_annual_days) — testable without
+  the database;
+- DB-backed tools (get_employee, annual_leave_entitlement) — look up one
+  person's facts and apply the V1 scope + LAW-002 precedence.
+"""
+
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+from ollama import embed
+from sqlalchemy import func, select, text as sa_text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .database import engine
+from .models import (
+    Approval,
+    Employee,
+    EmploymentStatus,
+    EmploymentType,
+    Jurisdiction,
+    LeaveRequest,
+)
+from .permissions import can_decide_leave, can_see
+
+EMBEDDING_MODEL = "bge-m3"
+
+# eligibility first (your 12 metadata fields), geometry second (<=> = cosine).
+SEARCH_SQL = sa_text("""
+    SELECT chunk_id, topic, subtopic, section, source_type, authority,
+           round((1 - (embedding <=> CAST(:q AS vector)))::numeric, 3) AS similarity,
+           text
+    FROM policy_chunks
+    WHERE (CAST(:juris AS TEXT) IS NULL
+           OR CAST(:juris AS TEXT) = ANY(jurisdiction))
+      AND effective_from <= CAST(:as_of AS DATE)
+      AND (effective_to IS NULL OR effective_to >= CAST(:as_of AS DATE))
+    ORDER BY embedding <=> CAST(:q AS vector)
+    LIMIT :k
+""")
+
+# Handbook §2: automated V1 covers ACTIVE FULL-TIME in Peninsular/Labuan.
+ESCALATE_JURISDICTIONS = {Jurisdiction.SABAH.value, Jurisdiction.SARAWAK.value}
+ESCALATE_EMPLOYMENT_TYPES = {
+    EmploymentType.PART_TIME.value,
+    EmploymentType.CONTRACT.value,
+}
+COMPANY_ANNUAL_DAYS = 18  # Handbook §4.1 (chunk HB-004) — active full-time
+HOSPITALISATION_CAP_DAYS = 60  # EA 1955 s.60F, separate pool (LAW-005)
+
+
+def completed_years(join: date, as_of: date) -> int:
+    """Whole years of continuous service = count of anniversaries passed.
+
+    Exact calendar math, not days/365.25: an employee joins on the 15th, the
+    14th is still year N-1. Statutory tiers hinge on these boundaries.
+    """
+    years = as_of.year - join.year
+    if (as_of.month, as_of.day) < (join.month, join.day):
+        years -= 1
+    return max(years, 0)
+
+
+def statutory_annual_days(years: int) -> int:
+    """Employment Act 1955 s.60E minimums (LAW-003, corrected): 8/8/12/16."""
+    if years < 5:
+        return 8
+    if years < 10:
+        return 12
+    return 16
+
+
+def statutory_sick_days(years: int) -> int:
+    """EA 1955 s.60F ordinary sick-leave minimums (LAW-005): 14/18/22."""
+    if years < 2:
+        return 14
+    if years < 5:
+        return 18
+    return 22
+
+
+def working_days_between(start: date, end: date) -> int:
+    """Weekday (Mon–Fri) count, inclusive. Weekends are additional to annual
+    leave (LAW-004), so they are never deducted. Public holidays are NOT yet
+    excluded — the holiday calendar is a pending Phase 3 task (HB §4.6:
+    the CALCULATOR, not the LLM, decides deductible days)."""
+    return sum(
+        1
+        for offset in range((end - start).days + 1)
+        if (start + timedelta(days=offset)).weekday() < 5
+    )
+
+
+def _usage(employee_no: str, leave_type: str, year: int) -> tuple[Decimal, Decimal]:
+    """(approved_days, pending_days) for one leave type and calendar year.
+
+    Year attribution uses start_date (a range crossing New Year counts wholly
+    to its start year — documented V1 simplification).
+    """
+    with Session(engine) as session:
+        rows = session.execute(
+            select(LeaveRequest.status, func.sum(LeaveRequest.requested_days))
+            .join(Employee, Employee.id == LeaveRequest.employee_id)
+            .where(
+                Employee.employee_no == employee_no,
+                LeaveRequest.leave_type == leave_type,
+                func.extract("year", LeaveRequest.start_date) == year,
+            )
+            .group_by(LeaveRequest.status)
+        ).all()
+    approved = sum((d for s, d in rows if s == "approved"), Decimal(0))
+    pending = sum(
+        (d for s, d in rows if s in ("pending_manager", "pending_hr")), Decimal(0)
+    )
+    return approved, pending
+
+
+def _scope_escalation(facts: dict, today: date) -> list[str]:
+    """Reasons this employee sits outside automated V1 ([] = in scope).
+
+    Shared by the balance tool and the submit tool so the two can never
+    disagree about who is allowed to play.
+    """
+    reasons = []
+    if facts["jurisdiction"] in ESCALATE_JURISDICTIONS:
+        reasons.append("jurisdiction outside V1: Sabah/Sarawak have separate ordinances")
+    if facts["employment_type"] in ESCALATE_EMPLOYMENT_TYPES:
+        reasons.append(f"{facts['employment_type']} employment outside automated scope (HB §2)")
+    if facts["employment_status"] != EmploymentStatus.ACTIVE.value:
+        reasons.append(f"employment not active ({facts['employment_status']})")
+    if facts["join_date"] > today.isoformat():
+        reasons.append("join_date is in the future — data error, needs HR fix")
+    return reasons
+
+
+def _facts(employee_no: str) -> dict | None:
+    """Raw DB lookup — internal helper; the public tool wraps it in status."""
+    with Session(engine) as session:
+        emp = (
+            session.query(Employee)
+            .filter_by(employee_no=employee_no)
+            .one_or_none()
+        )
+        if emp is None:
+            return None
+        return {
+            "employee_no": emp.employee_no,
+            "name": emp.full_name,
+            "role": emp.role.value,
+            "department": emp.department,
+            "manager_no": emp.manager.employee_no if emp.manager else None,
+            "join_date": emp.join_date.isoformat(),
+            "employment_type": emp.employment_type.value,
+            "jurisdiction": emp.jurisdiction.value,
+            "employment_status": emp.employment_status.value,
+        }
+
+
+def _check_access(employee_no: str, caller_employee_no: str | None) -> dict | None:
+    """Return a forbidden response, or None when access is allowed.
+
+    caller_employee_no=None means "the person asking is the subject" (self).
+    The session layer (agent loop) always injects the real caller — the LLM
+    is never trusted to name whose permissions apply.
+
+    V1 trade-off (documented on purpose): returning not_found vs forbidden
+    distinguishes "no such person" from "exists, hidden from you" — an
+    existence leak to unauthorized callers. A real product would collapse
+    both into one indistinguishable refusal; fine for a single-company demo.
+    """
+    caller = caller_employee_no or employee_no
+    if caller != employee_no and not can_see(caller, employee_no):
+        return {
+            "status": "forbidden",
+            "reason": "HR data is visible only to the employee themselves, "
+                      "their direct manager, or HR/admin (handbook §9)",
+            "next": "if genuinely needed, ask HR to review",
+        }
+    return None
+
+
+def get_employee(employee_no: str, *, caller_employee_no: str | None = None) -> dict:
+    """Fact lookup, access-checked. status: ok | forbidden | not_found."""
+    forbidden = _check_access(employee_no, caller_employee_no)
+    if forbidden:
+        return forbidden
+    facts = _facts(employee_no)
+    if facts is None:
+        return {"status": "not_found", "employee_no": employee_no}
+    return {"status": "ok", "facts": facts}
+
+
+def annual_leave_entitlement(
+    employee_no: str,
+    *,
+    caller_employee_no: str | None = None,
+    as_of: date | None = None,
+) -> dict:
+    """The decision-ready answer for "how much annual leave do I get?".
+
+    status is one of:
+      ok         — entitled_days computed, governed_by says which rule wins
+      forbidden  — caller may not see this employee's HR data (§9)
+      escalate   — reasons[] list; automation must stop here (handbook §8.5)
+      not_found  — no such employee
+    """
+    today = as_of or date.today()
+    forbidden = _check_access(employee_no, caller_employee_no)
+    if forbidden:
+        return forbidden          # deliberately carries NO target data
+    facts = _facts(employee_no)
+    if facts is None:
+        return {"status": "not_found", "employee_no": employee_no}
+
+    reasons = _scope_escalation(facts, today)
+    if reasons:
+        return {
+            "status": "escalate",
+            "employee_no": employee_no,
+            "name": facts["name"],
+            "reasons": reasons,
+            "next": "route to HR review (handbook §8.5)",
+        }
+
+    yrs = completed_years(date.fromisoformat(facts["join_date"]), today)
+    statutory = statutory_annual_days(yrs)
+    # LAW-002: compare, the more favourable valid term governs.
+    if COMPANY_ANNUAL_DAYS > statutory:
+        entitled, governed = COMPANY_ANNUAL_DAYS, "company_policy HB-004 §4.1"
+    else:  # (never today with 18 — kept for future policy versions, honestly)
+        entitled, governed = statutory, "statutory LAW-003 s.60E"
+
+    # the ledger speaks: approved counts as taken, pending holds days
+    approved, pending = _usage(employee_no, "annual", today.year)
+    remaining = entitled - approved            # after decisions
+    available = remaining - pending            # minus what awaits a decision
+
+    return {
+        "status": "ok",
+        "employee_no": employee_no,
+        "name": facts["name"],
+        "as_of": today.isoformat(),
+        "years_of_service": yrs,
+        "statutory_days": statutory,
+        "company_days": COMPANY_ANNUAL_DAYS,
+        "entitled_days": entitled,
+        "approved_days": float(approved),
+        "pending_days": float(pending),
+        "remaining_days": float(remaining),
+        "available_days": float(available),
+        "governed_by": governed,
+        "note": "available = entitled − approved − pending; pending requests "
+                "await a human decision and already hold their days",
+    }
+
+
+# ── step 4: the librarian tool ────────────────────────────────────────────────
+
+def search_chunks(
+    question: str,
+    jurisdiction: str | None = None,
+    k: int = 4,
+    as_of: date | None = None,
+) -> list[dict]:
+    """Low-level search: fingerprint the question (BGE-M3), let Postgres pick.
+
+    jurisdiction=None skips the eligibility filter (demo/testing only —
+    tools exposed to the agent always pass one).
+    """
+    qvec = embed(model=EMBEDDING_MODEL, input=[question])["embeddings"][0]
+    keys = ("chunk_id", "topic", "subtopic", "section", "source_type",
+            "authority", "similarity", "text")
+    with Session(engine) as session:
+        rows = session.execute(SEARCH_SQL, {
+            "q": str(qvec),
+            "juris": jurisdiction,
+            "as_of": as_of or date.today(),
+            "k": k,
+        }).fetchall()
+    return [
+        {**dict(zip(keys, row)), "similarity": float(row[6])}
+        for row in rows
+    ]
+
+
+def search_policy(
+    question: str,
+    employee_no: str,
+    *,
+    caller_employee_no: str | None = None,
+    k: int = 4,
+) -> dict:
+    """Find policy/law passages that EXPLAIN a topic to this employee.
+
+    Note the signature: there is NO jurisdiction parameter on purpose.
+    The employee's legal context is read from their DB row, so the LLM —
+    which writes every argument it passes — can never "claim" a different
+    jurisdiction to unlock rules that don't apply to them. caller is
+    likewise session-injected and checked before anything is searched.
+
+    status: found | forbidden | nothing_applicable | not_found
+    Result text is VERBATIM (citations must be quotable); this tool explains
+    rules, it never computes numbers — entitlement answers belong to
+    annual_leave_entitlement, and on any conflict that one governs.
+    """
+    forbidden = _check_access(employee_no, caller_employee_no)
+    if forbidden:
+        return forbidden
+    facts = _facts(employee_no)
+    if facts is None:
+        return {"status": "not_found", "employee_no": employee_no}
+
+    results = search_chunks(question, jurisdiction=facts["jurisdiction"], k=k)
+    if not results:
+        return {
+            "status": "nothing_applicable",
+            "employee_no": employee_no,
+            "jurisdiction": facts["jurisdiction"],
+            "reason": "no V1-eligible policy or law passages cover this "
+                      "question for this employee's context",
+            "next": "escalate to HR review (handbook §8.5)",
+        }
+    return {
+        "status": "found",
+        "question": question,
+        "asked_for": employee_no,
+        "jurisdiction_used": facts["jurisdiction"],
+        "results": results,
+        "note": "explanatory passages with citations; all numbers must come "
+                "from the deterministic tools",
+    }
+
+
+# ── step 2 of phase 3: the writing hand ──────────────────────────────────────
+
+SUBMITTABLE_TYPES = ("annual", "sick", "hospitalisation")
+
+
+def _coerce_bool(value) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "yes", "1")
+
+
+def submit_leave_request(
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    *,
+    caller_employee_no: str | None = None,
+    day_portion: str | None = None,
+    reason: str | None = None,
+    medical_certificate_provided: bool | str | None = None,
+    medical_certificate_reference: str | None = None,
+    employee_notified_at: str | None = None,
+    as_of: date | None = None,
+) -> dict:
+    """Create ONE pending leave request for the caller. INSERT-ONLY by design:
+    there is no code path here that can approve, reject, cancel or modify.
+
+    Route by type (handbook §8): annual → pending_manager; sick and
+    hospitalisation → pending_hr (medical verification).
+
+    status: created | rejected | escalate | not_found
+    """
+    today = as_of or date.today()
+
+    if not caller_employee_no:
+        return {"status": "rejected",
+                "reason": "a request must have an owner — no caller identity"}
+    if leave_type not in SUBMITTABLE_TYPES:
+        return {"status": "rejected",
+                "reason": f"leave_type must be one of {list(SUBMITTABLE_TYPES)}"}
+    try:
+        start = date.fromisoformat(str(start_date))
+        end = date.fromisoformat(str(end_date))
+    except ValueError:
+        return {"status": "rejected",
+                "reason": "dates must be ISO format, e.g. 2026-12-24"}
+    if end < start:
+        return {"status": "rejected", "reason": "end_date is before start_date"}
+
+    facts = _facts(caller_employee_no)
+    if facts is None:
+        return {"status": "not_found", "employee_no": caller_employee_no}
+    reasons = _scope_escalation(facts, today)
+    if reasons:
+        return {"status": "escalate", "reasons": reasons,
+                "next": "route to HR review (handbook §8.5) — nothing was created"}
+
+    # deductible days — the CALCULATOR decides, never the LLM (HB §4.6)
+    if day_portion:
+        if day_portion not in ("am", "pm") or start != end:
+            return {"status": "rejected",
+                    "reason": "day_portion applies only to a single-day request"}
+        requested = Decimal("0.5") if start.weekday() < 5 else Decimal("0")
+    else:
+        requested = Decimal(working_days_between(start, end))
+    if requested <= 0:
+        return {"status": "rejected",
+                "reason": "range contains no working days (weekends are "
+                          "always excluded; public holidays not yet tracked)"}
+
+    yrs = completed_years(date.fromisoformat(facts["join_date"]), today)
+    approved, pending = _usage(caller_employee_no, leave_type, start.year)
+    if leave_type == "annual":
+        cap = max(COMPANY_ANNUAL_DAYS, statutory_annual_days(yrs))
+        route = "pending_manager"
+    elif leave_type == "sick":
+        cap = statutory_sick_days(yrs)
+        route = "pending_hr"
+    else:
+        cap = HOSPITALISATION_CAP_DAYS
+        route = "pending_hr"
+    available = Decimal(cap) - approved - pending
+
+    if requested > available:
+        return {
+            "status": "rejected",
+            "reason": f"insufficient balance: requested {float(requested)} days, "
+                      f"available {float(available)} (cap {cap}, "
+                      f"approved {float(approved)}, pending {float(pending)})",
+            "next": "offer fewer dates, other dates, or HR review (HB §4.5)",
+        }
+
+    notified = None
+    if employee_notified_at:
+        try:
+            notified = datetime.fromisoformat(str(employee_notified_at))
+        except ValueError:
+            return {"status": "rejected",
+                    "reason": "employee_notified_at must be an ISO datetime"}
+
+    with Session(engine) as session:
+        year_count = session.scalar(
+            select(func.count()).select_from(LeaveRequest)
+            .where(LeaveRequest.request_no.like(f"LV-{start.year}-%"))
+        )
+        employee_id = session.scalar(
+            select(Employee.id).where(Employee.employee_no == caller_employee_no)
+        )
+        row = LeaveRequest(
+            request_no=f"LV-{start.year}-{year_count + 1:04d}",
+            employee_id=employee_id,
+            leave_type=leave_type,
+            start_date=start,
+            end_date=end,
+            requested_days=requested,
+            day_portion=day_portion,
+            reason=reason,
+            medical_certificate_provided=_coerce_bool(medical_certificate_provided),
+            medical_certificate_reference=medical_certificate_reference,
+            employee_notified_at=notified,
+            status=route,
+        )
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return {"status": "rejected",
+                    "reason": "a live request for the same dates and type "
+                              "already exists for this employee"}
+        request_no = row.request_no
+
+    return {
+        "status": "created",
+        "request_no": request_no,
+        "leave_type": leave_type,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "days": float(requested),
+        "route": route,
+        "note": "submitted for a human decision — the assistant cannot "
+                "approve, reject or cancel it",
+    }
+
+
+# ── phase 4: the decision recorder ───────────────────────────────────────────
+
+def decide_leave_request(
+    request_no: str,
+    decision: str,
+    *,
+    caller_employee_no: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Record a HUMAN decision (approved/rejected) on a pending leave request.
+
+    The agent never decides — it only writes down what an authorized human
+    said, after the backend checks that the caller really holds that
+    authority (permissions.can_decide_leave):
+      pending_manager → the requester's direct manager, or HR/admin
+      pending_hr      → HR/admin only
+    Self-decision is never allowed. A rejection requires a reason (it becomes
+    the employee-facing explanation in the audit trail).
+
+    status: decided | forbidden | rejected | not_found
+    """
+    if not caller_employee_no:
+        return {"status": "rejected",
+                "reason": "a decision must have an identified human caller"}
+    if decision not in ("approved", "rejected"):
+        return {"status": "rejected",
+                "reason": "decision must be 'approved' or 'rejected'"}
+    if decision == "rejected" and not (reason or "").strip():
+        return {"status": "rejected",
+                "reason": "a rejection needs a reason — it is recorded for "
+                          "the employee"}
+
+    with Session(engine) as session:
+        req = session.scalar(
+            select(LeaveRequest).where(LeaveRequest.request_no == request_no)
+        )
+        if req is None:
+            return {"status": "not_found", "request_no": request_no}
+        if req.status not in ("pending_manager", "pending_hr"):
+            return {"status": "rejected",
+                    "reason": f"request is '{req.status}' — only pending "
+                              f"requests can be decided"}
+
+        requester = session.get(Employee, req.employee_id)
+        level = "manager" if req.status == "pending_manager" else "hr"
+        if not can_decide_leave(caller_employee_no, requester.employee_no, level):
+            return {
+                "status": "forbidden",
+                "reason": f"this is a '{level}'-level decision and you do not "
+                          f"hold that authority for {requester.employee_no}",
+                "next": "the employee's direct manager, or HR, must decide",
+            }
+
+        approver = session.scalar(
+            select(Employee).where(Employee.employee_no == caller_employee_no)
+        )
+        session.add(Approval(
+            leave_request_id=req.id,
+            approval_level=level,
+            approver_employee_id=approver.id,
+            decision=decision,
+            reason=reason,
+            requested_at=req.submitted_at,
+        ))
+        req.status = decision
+        req.decided_at = func.now()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return {"status": "rejected",
+                    "reason": "this request already has a recorded decision "
+                              "at that level"}
+
+        return {
+            "status": "decided",
+            "request_no": request_no,
+            "decision": decision,
+            "approval_level": level,
+            "decided_by": caller_employee_no,
+            "employee_no": requester.employee_no,
+            "reason": reason,
+            "note": "recorded with full audit trail — balances now reflect "
+                    "this decision",
+        }
