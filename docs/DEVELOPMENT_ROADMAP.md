@@ -158,8 +158,19 @@ on the menu — the agent records decisions only for an authorized human caller.
 57 pytest cases green. Live demo: peer attempt → forbidden; Siti approved
 `LV-2026-0001` with a full audit row (level=manager, approver, requested_at,
 decided_at); balance moved pending 2→0, approved 0→2, remaining 18→16.
-Remaining: flexible-work requests table + tools; persistent agent cases with
-restart recovery and duplicate-event handling.
+**Flexible work done (2026-09-17):** `flexible_work_requests` table
+(migration `a8e02af4d7bd`) with multi-dimension booleans (hours/days/place,
+at-least-one enforced in DB and tool), two code-computed deadline clocks
+(30-day company target per HB §7.5, 60-day statutory per LAW-008 s.60Q)
+stored as snapshots with provenance FK to the policy document;
+`approvals` extended with `fwa_request_id` + exactly-one-target CHECK
+(autogenerate MISSED this check — caught in review, hand-added);
+`submit_fwa_request` and unified `decide_request` (LV-/FW- routing) tools;
+two-stage flow — manager approval advances to `pending_hr`, HR finalizes;
+rejections require reasons (§7.6). 72 pytest cases green. Live demo:
+Wei Jie's WFH request created with agent-flagged deadline note → manager
+approved (advanced) → HR approved (final), two audit rows with names.
+Remaining: persistent agent cases with restart recovery.
 
 Learn the difference between conversation history and durable task state.
 

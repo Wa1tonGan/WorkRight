@@ -17,9 +17,10 @@ from ollama import chat
 
 from .tools import (
     annual_leave_entitlement,
-    decide_leave_request,
+    decide_request,
     get_employee,
     search_policy,
+    submit_fwa_request,
     submit_leave_request,
 )
 
@@ -35,12 +36,13 @@ You answer questions about leave and flexible working using tools ONLY. Rules:
   "nothing_applicable", relay it honestly and suggest contacting HR.
 - When you rely on a policy passage, cite its id (e.g. HB-004, LAW-003).
 - Be brief and plain. You cannot approve, reject or modify anything —
-  humans do that. You MAY create a leave request for the employee you are
-  talking to via submit_leave_request; it will be PENDING for a human
-  decision. Confirm the dates with the employee before creating it.
-  If a manager or HR person tells you their decision on a pending request,
-  you may record it with decide_leave_request — but only when THEY decided,
-  never on your own initiative.
+  humans do that. You MAY create a leave request (submit_leave_request) or a
+  flexible-working request (submit_fwa_request) for the employee you are
+  talking to; both are PENDING a human decision. Confirm details before
+  creating them. If a manager or HR person tells you their decision on a
+  pending request, you may record it with decide_request — but only when
+  THEY decided, never on your own initiative. Note: flexible-work requests
+  need BOTH a manager and an HR decision; a manager approval is not final.
 """
 
 # name -> (function, menu-args, required args, description). The menu
@@ -85,18 +87,35 @@ MENU = {
                         "cannot approve, reject or cancel. Check entitlement "
                         "first and confirm dates with the employee before calling.",
     },
-    "decide_leave_request": {
-        "fn": decide_leave_request,
-        "args": {"request_no": "string, e.g. LV-2026-0001",
+    "decide_request": {
+        "fn": decide_request,
+        "args": {"request_no": "string, starts with LV- or FW-, e.g. LV-2026-0001",
                   "decision": "'approved' or 'rejected'",
                   "reason": "optional note; REQUIRED for rejections"},
         "required": ["request_no", "decision"],
-        "description": "Record a HUMAN decision on a pending leave request. "
-                        "Only the employee's direct manager (manager-level) or "
-                        "HR (either level) may decide — the backend verifies "
-                        "and refuses anyone else. Call this ONLY after the "
-                        "authorized person has actually told you their decision; "
-                        "you can never decide on their behalf.",
+        "description": "Record a HUMAN decision on a pending request. Leave (LV-) "
+                        "has one stage; flexible work (FW-) has TWO — a manager "
+                        "approval advances it to HR (not final). Only the "
+                        "employee's direct manager (manager stage) or HR (either "
+                        "stage) may decide — the backend verifies and refuses "
+                        "anyone else. Call this ONLY after the authorized person "
+                        "has actually told you their decision.",
+    },
+    "submit_fwa_request": {
+        "fn": submit_fwa_request,
+        "args": {"requested_arrangement": "clear description, e.g. 'Work from home Mon/Wed/Fri, 9am-6pm'",
+                  "proposed_start_date": "ISO date, e.g. 2026-12-01",
+                  "change_hours": "true/false — is the arrangement changing HOURS of work?",
+                  "change_days": "true/false — changing DAYS of work?",
+                  "change_place": "true/false — changing PLACE of work?",
+                  "proposed_end_date": "optional ISO date; omit if the arrangement is indefinite",
+                  "employee_reason": "optional reason from the employee"},
+        "required": ["requested_arrangement", "proposed_start_date"],
+        "description": "Create a flexible-working (work from home / hours / days) "
+                        "request for the employee you are talking to. Needs at "
+                        "least one dimension set to true. Submitted PENDING — "
+                        "manager first, then HR; you cannot decide it. Ask for "
+                        "missing details before submitting (handbook §7.3).",
     },
 }
 
@@ -153,11 +172,22 @@ def _execute(name: str, args: dict, caller_employee_no: str) -> dict:
                 reason=args.get("reason"),
                 caller_employee_no=caller_employee_no,
             )
-        if name == "decide_leave_request":
+        if name == "decide_request":
             return entry["fn"](
                 request_no=args["request_no"],
                 decision=args["decision"],
                 reason=args.get("reason"),
+                caller_employee_no=caller_employee_no,
+            )
+        if name == "submit_fwa_request":
+            return entry["fn"](
+                requested_arrangement=args["requested_arrangement"],
+                proposed_start_date=args.get("proposed_start_date"),
+                change_hours=args.get("change_hours", False),
+                change_days=args.get("change_days", False),
+                change_place=args.get("change_place", False),
+                proposed_end_date=args.get("proposed_end_date"),
+                employee_reason=args.get("employee_reason"),
                 caller_employee_no=caller_employee_no,
             )
     except Exception:                      # tool blew up → honest escalation

@@ -269,11 +269,12 @@ class LeaveRequest(Base):
 
 
 class Approval(Base):
-    """Audit trail of HUMAN decisions on leave requests.
+    """Audit trail of HUMAN decisions on leave AND flexible-work requests.
 
-    One decision row per request per level. The agent writes here ONLY on
-    behalf of a caller whose authority the backend has verified
-    (permissions.can_decide_leave) — the model itself never decides.
+    One decision row per request per level. Both FKs are nullable with an
+    exactly-one CHECK, so a decision always targets exactly one kind of
+    request. The agent writes here ONLY on behalf of a caller whose
+    authority the backend has verified — the model itself never decides.
     """
 
     __tablename__ = "approvals"
@@ -281,8 +282,11 @@ class Approval(Base):
     id: Mapped[str] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
-    leave_request_id: Mapped[str] = mapped_column(
+    leave_request_id: Mapped[str | None] = mapped_column(
         ForeignKey("leave_requests.id", ondelete="CASCADE")
+    )
+    fwa_request_id: Mapped[str | None] = mapped_column(
+        ForeignKey("flexible_work_requests.id", ondelete="CASCADE")
     )
     approval_level: Mapped[str] = mapped_column(Text)      # manager | hr
     approver_employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"))
@@ -301,6 +305,10 @@ class Approval(Base):
 
     __table_args__ = (
         CheckConstraint(
+            "(leave_request_id IS NULL) <> (fwa_request_id IS NULL)",
+            name="ck_approval_exactly_one_target",
+        ),
+        CheckConstraint(
             "approval_level IN ('manager', 'hr')",
             name="ck_approval_level",
         ),
@@ -312,4 +320,77 @@ class Approval(Base):
             "leave_request_id", "approval_level",
             name="uq_approval_per_request_level",
         ),
+        UniqueConstraint(
+            "fwa_request_id", "approval_level",
+            name="uq_fwa_approval_per_level",
+        ),
+    )
+
+
+class FlexibleWorkRequest(Base):
+    """Flexible working arrangement request (handbook §7, EA s.60P/60Q).
+
+    Two structural differences from leave:
+    - a request may change SEVERAL dimensions at once (hours/days/place);
+    - normal path is TWO human stages: manager (operational feasibility)
+      then HR (policy/compliance) — a manager 'approval' moves the request
+      to pending_hr, it is not a final decision.
+    """
+
+    __tablename__ = "flexible_work_requests"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    request_no: Mapped[str] = mapped_column(Text, unique=True)      # FW-2026-0001
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"))
+
+    # dimensions — at least one must be requested
+    change_hours: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    change_days: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    change_place: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+
+    requested_arrangement: Mapped[str] = mapped_column(Text)
+    employee_reason: Mapped[str | None] = mapped_column(Text)
+    proposed_start_date: Mapped[date | None] = mapped_column(Date)
+    proposed_end_date: Mapped[date | None] = mapped_column(Date)    # NULL = indefinite
+
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # Both clocks are SNAPSHOTS computed by backend code at submission
+    # (handbook §7.5): statutory 60-day due date + company 30-day target.
+    # Never set by the LLM; provenance recorded via decision_basis_policy_id.
+    decision_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    target_decision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_basis_policy_id: Mapped[str | None] = mapped_column(
+        ForeignKey("policy_documents.id")
+    )
+
+    status: Mapped[str] = mapped_column(Text, server_default="'pending_manager'")
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "change_hours OR change_days OR change_place",
+            name="ck_fwa_at_least_one_dimension",
+        ),
+        CheckConstraint(
+            "proposed_end_date IS NULL OR proposed_start_date IS NULL "
+            "OR proposed_end_date >= proposed_start_date",
+            name="ck_fwa_dates_ordered",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'pending_manager', 'pending_hr', 'approved', "
+            "'rejected', 'withdrawn', 'escalated')",
+            name="ck_fwa_status",
+        ),
+        Index("ix_fwa_employee_status", "employee_id", "status"),
     )

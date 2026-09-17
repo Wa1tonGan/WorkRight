@@ -12,7 +12,7 @@ Two layers, deliberately separated:
   person's facts and apply the V1 scope + LAW-002 precedence.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from ollama import embed
@@ -26,8 +26,10 @@ from .models import (
     Employee,
     EmploymentStatus,
     EmploymentType,
+    FlexibleWorkRequest,
     Jurisdiction,
     LeaveRequest,
+    PolicyDocument,
 )
 from .permissions import can_decide_leave, can_see
 
@@ -568,4 +570,244 @@ def decide_leave_request(
             "reason": reason,
             "note": "recorded with full audit trail — balances now reflect "
                     "this decision",
+        }
+
+
+# ── phase 4 part 2: flexible working arrangements ────────────────────────────
+
+FWA_STATUTORY_DAYS = 60      # EA 1955 s.60Q, per the legal corpus (LAW-008)
+FWA_COMPANY_TARGET_DAYS = 30  # Handbook §7.5 internal service target
+
+
+def submit_fwa_request(
+    requested_arrangement: str,
+    *,
+    caller_employee_no: str | None = None,
+    change_hours: bool | str = False,
+    change_days: bool | str = False,
+    change_place: bool | str = False,
+    proposed_start_date: str | None = None,
+    proposed_end_date: str | None = None,
+    employee_reason: str | None = None,
+    as_of: date | None = None,
+) -> dict:
+    """Create ONE pending flexible-working request for the caller.
+
+    INSERT-only, like leave. Both deadline clocks are computed HERE, by code,
+    from the submission moment (handbook §7.5) and never by the LLM; the
+    statutory basis row is recorded for provenance. A request must change at
+    least one dimension (hours/days/place) — that check exists in both the
+    tool and the database.
+
+    status: created | rejected | escalate | not_found
+    """
+    today = as_of or date.today()
+    if not caller_employee_no:
+        return {"status": "rejected",
+                "reason": "a request must have an owner — no caller identity"}
+    flags = {k: _coerce_bool(v) for k, v in (
+        ("hours", change_hours), ("days", change_days), ("place", change_place),
+    )}
+    if not any(flags.values()):
+        return {"status": "rejected",
+                "reason": "a flexible-work request must change at least one of: "
+                          "hours, days, place of work"}
+    if not (requested_arrangement or "").strip():
+        return {"status": "rejected",
+                "reason": "requested_arrangement describing the desired "
+                          "arrangement is required"}
+
+    start = end = None
+    if proposed_start_date:
+        try:
+            start = date.fromisoformat(str(proposed_start_date))
+        except ValueError:
+            return {"status": "rejected",
+                    "reason": "proposed_start_date must be ISO format YYYY-MM-DD"}
+    else:
+        return {"status": "rejected",
+                "reason": "proposed_start_date is required (handbook §7.3) — "
+                          "ask the employee when it should begin"}
+    if proposed_end_date:
+        try:
+            end = date.fromisoformat(str(proposed_end_date))
+        except ValueError:
+            return {"status": "rejected",
+                    "reason": "proposed_end_date must be ISO format YYYY-MM-DD"}
+        if end < start:
+            return {"status": "rejected",
+                    "reason": "proposed_end_date is before proposed_start_date"}
+
+    facts = _facts(caller_employee_no)
+    if facts is None:
+        return {"status": "not_found", "employee_no": caller_employee_no}
+    reasons = _scope_escalation(facts, today)
+    if reasons:
+        return {"status": "escalate", "reasons": reasons,
+                "next": "route to HR review (handbook §8.5) — nothing was created"}
+
+    submitted = datetime.now(timezone.utc)
+    decision_due = submitted + timedelta(days=FWA_STATUTORY_DAYS)
+    company_target = submitted + timedelta(days=FWA_COMPANY_TARGET_DAYS)
+
+    with Session(engine) as session:
+        basis_id = session.scalar(
+            select(PolicyDocument.id).where(
+                PolicyDocument.local_path == "knowledge/law/workright_legal_policy_v1.md"
+            )
+        )
+        year_count = session.scalar(
+            select(func.count()).select_from(FlexibleWorkRequest)
+            .where(FlexibleWorkRequest.request_no.like(f"FW-{today.year}-%"))
+        )
+        employee_id = session.scalar(
+            select(Employee.id).where(Employee.employee_no == caller_employee_no)
+        )
+        row = FlexibleWorkRequest(
+            request_no=f"FW-{today.year}-{year_count + 1:04d}",
+            employee_id=employee_id,
+            change_hours=flags["hours"],
+            change_days=flags["days"],
+            change_place=flags["place"],
+            requested_arrangement=requested_arrangement.strip(),
+            employee_reason=employee_reason,
+            proposed_start_date=start,
+            proposed_end_date=end,
+            submitted_at=submitted,
+            decision_due_at=decision_due,
+            target_decision_at=company_target,
+            decision_basis_policy_id=basis_id,
+            status="pending_manager",
+        )
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return {"status": "rejected",
+                    "reason": "could not create the request — please retry"}
+        request_no = row.request_no
+
+    return {
+        "status": "created",
+        "request_no": request_no,
+        "dimensions": [k for k, v in flags.items() if v],
+        "requested_arrangement": requested_arrangement.strip(),
+        "proposed_start_date": start.isoformat(),
+        "proposed_end_date": end.isoformat() if end else None,
+        "route": "pending_manager (then HR)",
+        "statutory_due": decision_due.date().isoformat(),
+        "company_target": company_target.date().isoformat(),
+        "note": "submitted for human decisions — manager first, then HR. "
+                "The assistant cannot decide.",
+    }
+
+
+def decide_request(
+    request_no: str,
+    decision: str,
+    *,
+    caller_employee_no: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Record a HUMAN decision on a leave (LV-) or flexible-work (FW-) request.
+
+    Leave: one stage (manager for annual, HR for sick/hospitalisation).
+    Flexible work: TWO stages — a manager 'approved' ADVANCES the request to
+    pending_hr (status "advanced"); only the HR stage finalizes.
+
+    Authority is verified by the backend (permissions.can_decide_leave);
+    self-decision is never allowed; rejections require a reason.
+    """
+    if not isinstance(request_no, str):
+        return {"status": "rejected", "reason": "request_no is required"}
+    if request_no.startswith("LV-"):
+        return decide_leave_request(request_no, decision,
+                                    caller_employee_no=caller_employee_no,
+                                    reason=reason)
+    if not request_no.startswith("FW-"):
+        return {"status": "rejected",
+                "reason": "request_no must start with LV- (leave) or FW- "
+                          "(flexible work)"}
+
+    if not caller_employee_no:
+        return {"status": "rejected",
+                "reason": "a decision must have an identified human caller"}
+    if decision not in ("approved", "rejected"):
+        return {"status": "rejected",
+                "reason": "decision must be 'approved' or 'rejected'"}
+    if decision == "rejected" and not (reason or "").strip():
+        return {"status": "rejected",
+                "reason": "a rejection needs a reason — it is recorded for "
+                          "the employee (handbook §7.6)"}
+
+    with Session(engine) as session:
+        req = session.scalar(
+            select(FlexibleWorkRequest)
+            .where(FlexibleWorkRequest.request_no == request_no)
+        )
+        if req is None:
+            return {"status": "not_found", "request_no": request_no}
+        if req.status not in ("pending_manager", "pending_hr"):
+            return {"status": "rejected",
+                    "reason": f"request is '{req.status}' — only pending "
+                              f"requests can be decided"}
+
+        requester = session.get(Employee, req.employee_id)
+        level = "manager" if req.status == "pending_manager" else "hr"
+        if not can_decide_leave(caller_employee_no, requester.employee_no, level):
+            return {
+                "status": "forbidden",
+                "reason": f"this is a '{level}'-stage decision and you do not "
+                          f"hold that authority for {requester.employee_no}",
+                "next": "the employee's direct manager, or HR, must decide",
+            }
+
+        approver = session.scalar(
+            select(Employee).where(Employee.employee_no == caller_employee_no)
+        )
+        session.add(Approval(
+            fwa_request_id=req.id,
+            approval_level=level,
+            approver_employee_id=approver.id,
+            decision=decision,
+            reason=reason,
+            requested_at=req.submitted_at,
+        ))
+
+        if decision == "rejected":
+            req.status = "rejected"
+            req.decision_reason = reason
+            req.decided_at = func.now()
+            outcome = "decided"
+            note = "rejection recorded with full audit trail"
+        elif level == "manager":
+            req.status = "pending_hr"           # advances, NOT final
+            outcome = "advanced"
+            note = "manager stage recorded — the request now awaits HR"
+        else:
+            req.status = "approved"
+            req.decision_reason = reason
+            req.decided_at = func.now()
+            outcome = "decided"
+            note = "final approval recorded — both stages complete"
+
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return {"status": "rejected",
+                    "reason": "this request already has a recorded decision "
+                              "at that stage"}
+
+        return {
+            "status": outcome,
+            "request_no": request_no,
+            "decision": decision,
+            "stage": level,
+            "decided_by": caller_employee_no,
+            "employee_no": requester.employee_no,
+            "new_status": req.status,
+            "reason": reason,
+            "note": note,
         }
