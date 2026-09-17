@@ -195,6 +195,20 @@ Completion: documented results demonstrate the supported workflows and identify 
 
 ## Phase 6 — Interface
 
+**Login system + React app landed (2026-09-17):** `employees.password_hash`
+(bcrypt) + `sessions` table (migration `d124367b5ba3`; session tokens stored
+as SHA-256 digests, 7-day expiry, revocable); `backend/auth.py` + `/auth/
+login|logout|me` endpoints; **`/chat` no longer accepts an employee_no in the
+body — identity comes from the session cookie only** (the documented V1
+trust placeholder is closed). Demo password `workright123` for all fictional
+employees, seeded via `seed.set_demo_passwords()`. 80 pytest cases green.
+Frontend: React + Vite + TypeScript app in `frontend/` — login page with a
+one-click demo cast, chat page showing the logged-in identity, answers with
+a collapsible tool-call trace, suggestion chips, session-expiry handling.
+Vite proxies /auth + /chat + /health to :8000 (same-origin cookies, no CORS).
+Run: `uv run uvicorn backend.main:app --port 8000` + `cd frontend && npm run
+dev` → http://localhost:5173. Next: request-history panel, manager inbox.
+
 Started early (2026-09-17): `POST /chat` added to the FastAPI app —
 `{"message", "employee_no"}` in, `{answer, trace, rounds}` out, with the
 no-login trust note documented in code (Layer 1 of the interface: the door

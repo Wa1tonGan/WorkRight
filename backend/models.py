@@ -96,6 +96,9 @@ class Employee(Base):
     )
     employment_end_date: Mapped[date | None] = mapped_column(Date)
 
+    # login credential — bcrypt hash; NULL = cannot log in (until seeded)
+    password_hash: Mapped[str | None] = mapped_column(Text)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -393,4 +396,30 @@ class FlexibleWorkRequest(Base):
             name="ck_fwa_status",
         ),
         Index("ix_fwa_employee_status", "employee_id", "status"),
+    )
+
+
+class Session(Base):
+    """Login sessions — the source of identity for /chat.
+
+    The raw token lives ONLY in the user's httpOnly cookie; the database
+    stores its SHA-256 digest, so a leaked DB dump cannot be replayed as a
+    login. Expiry is enforced on every resolve; logout marks revoked_at.
+    """
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    token_hash: Mapped[str] = mapped_column(Text, unique=True)   # sha256 hex
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_sessions_employee", "employee_id"),
     )

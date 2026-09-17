@@ -1,18 +1,24 @@
 """WorkRight backend entry point.
 
 The API surface:
-  GET  /health  — liveness + database layers
-  POST /chat    — the agent's front door (question in, answer + trace out)
+  GET  /health        — liveness + database layers
+  POST /auth/login    — email + password → session cookie
+  POST /auth/logout   — revoke the session
+  GET  /auth/me       — who am I?
+  POST /chat          — the agent's front door (session-identified)
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from . import auth
 from .agent import run_agent
 from .database import engine
 
 app = FastAPI(title="WorkRight backend")
+
+SESSION_COOKIE = "wr_session"
 
 
 @app.get("/health")
@@ -36,25 +42,67 @@ def health() -> dict:
         return {"status": "degraded", "database": "down"}
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/login")
+def login_endpoint(body: LoginRequest, response: Response) -> dict:
+    """Verify credentials; the session token goes into an httpOnly cookie."""
+    result = auth.login(body.email, body.password)
+    if result["status"] != "ok":
+        # one message for both wrong-email and wrong-password (no user probing)
+        raise HTTPException(status_code=401, detail="invalid email or password")
+    response.set_cookie(
+        SESSION_COOKIE,
+        result["token"],
+        httponly=True,          # JavaScript cannot read it (XSS mitigation)
+        samesite="lax",         # basic CSRF mitigation
+        max_age=auth.SESSION_LIFETIME_DAYS * 24 * 3600,
+    )
+    return {
+        "employee_no": result["employee_no"],
+        "name": result["name"],
+        "role": result["role"],
+    }
+
+
+@app.post("/auth/logout")
+def logout_endpoint(request: Request, response: Response) -> dict:
+    auth.logout(request.cookies.get(SESSION_COOKIE))
+    response.delete_cookie(SESSION_COOKIE)
+    return {"status": "logged_out"}
+
+
+@app.get("/auth/me")
+def me_endpoint(request: Request) -> dict:
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="not logged in")
+    return identity
+
+
 class ChatRequest(BaseModel):
     message: str
-    employee_no: str  # who is talking (e.g. WR-0002)
+    # NOTE: no employee_no — identity comes from the session cookie ONLY.
+    # The old body-supplied identity was a documented V1 placeholder; the
+    # sessions table replaced it. The agent and its tools are unchanged.
 
 
 @app.post("/chat")
-def chat(request: ChatRequest) -> dict:
-    """One question in, one answer out — through the full agent loop.
-
-    TRUST NOTE (V1 placeholder): there is no login yet, so employee_no is
-    taken at face value. All respect for the caller happens inside the tools
-    (permission checks, session injection) — a real deployment replaces this
-    line with authentication; the agent itself does not change.
+def chat(request: Request, body: ChatRequest) -> dict:
+    """One question in, one answer out — as the LOGGED-IN person.
 
     NOTE: the loop takes seconds (2–4 local LLM calls); `def` (not async)
     keeps FastAPI serving other requests meanwhile.
     """
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401,
+                            detail="login required — POST /auth/login first")
     try:
-        return run_agent(request.message, request.employee_no)
+        return run_agent(body.message, identity["employee_no"])
     except Exception:
         return {"status": "error",
                 "reason": "agent or local model unavailable — try again"}

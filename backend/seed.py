@@ -118,3 +118,23 @@ def seed() -> None:
 
 if __name__ == "__main__":
     seed()
+
+
+def set_demo_passwords(password: str | None = None) -> None:
+    """Give every employee the demo password (idempotent).
+
+    Fictional people, local demo — one shared password keeps the login page
+    usable. A real deployment would force per-user secrets on first login.
+    """
+    from .auth import DEMO_PASSWORD, hash_password
+
+    pw_hash = hash_password(password or DEMO_PASSWORD)
+    with Session(engine) as session:
+        changed = 0
+        for emp in session.scalars(select(Employee)):
+            if emp.password_hash != pw_hash:
+                emp.password_hash = pw_hash
+                changed += 1
+        session.commit()
+        print(f"demo password set for {changed} employees "
+              f"(password: {password or DEMO_PASSWORD})")
