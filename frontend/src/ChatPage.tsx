@@ -1,9 +1,12 @@
 import { useRef, useState } from "react";
-import { api, type ChatResult, type Identity, type TraceStep } from "./api";
+import { chatStream, type Identity, type StreamEvent, type TraceStep } from "./api";
 
 type Message =
   | { id: number; role: "user"; text: string }
   | { id: number; role: "assistant"; text: string; trace?: TraceStep[] };
+
+type LiveStep = { tool: string; args?: Record<string, unknown>; status?: string };
+type Live = { round: number; steps: LiveStep[] };
 
 const SUGGESTIONS = [
   "How many annual leave days do I have left?",
@@ -30,6 +33,7 @@ export default function ChatPage({
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [live, setLive] = useState<Live | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -40,11 +44,55 @@ export default function ChatPage({
     setError(null);
     setMessages((m) => [...m, { id: nextId++, role: "user", text: message }]);
     setBusy(true);
+    setLive({ round: 1, steps: [] });
+
+    const toolSteps: TraceStep[] = [];
+    let answerText = "";
+    let streamError: string | null = null;
+
+    const onEvent = (ev: StreamEvent) => {
+      switch (ev.type) {
+        case "round":
+          setLive((l) => (l ? { ...l, round: ev.round } : l));
+          break;
+        case "tool_request":
+          toolSteps.push({ round: ev.round, type: "tool", tool: ev.tool, args: ev.args });
+          setLive((l) =>
+            l ? { ...l, steps: [...l.steps, { tool: ev.tool, args: ev.args }] } : l,
+          );
+          break;
+        case "tool_result": {
+          const step = [...toolSteps].reverse().find((s) => s.tool === ev.tool && !s.status);
+          if (step) step.status = ev.status;
+          setLive((l) => {
+            if (!l) return l;
+            const steps = [...l.steps];
+            for (let i = steps.length - 1; i >= 0; i--) {
+              if (steps[i].tool === ev.tool && !steps[i].status) {
+                steps[i] = { ...steps[i], status: ev.status };
+                break;
+              }
+            }
+            return { ...l, steps };
+          });
+          break;
+        }
+        case "answer":
+          answerText = ev.answer;
+          break;
+        case "error":
+          streamError = ev.reason;
+          break;
+      }
+    };
+
     try {
-      const result: ChatResult = await api.chat(message);
+      await chatStream(message, onEvent);
+      if (streamError) throw new Error(streamError);
+      if (!answerText) throw new Error("The agent did not produce an answer — try again.");
       setMessages((m) => [
         ...m,
-        { id: nextId++, role: "assistant", text: result.answer, trace: result.trace },
+        { id: nextId++, role: "assistant", text: answerText, trace: toolSteps },
       ]);
     } catch (err) {
       const reason = err instanceof Error ? err.message : "Something went wrong";
@@ -52,6 +100,7 @@ export default function ChatPage({
       if (reason.includes("Session expired")) onLogout();
     } finally {
       setBusy(false);
+      setLive(null);
       requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }));
     }
   }
@@ -74,16 +123,14 @@ export default function ChatPage({
       <main className="chat-main">
         {messages.map((m) => {
           const tools =
-            m.role === "assistant"
-              ? (m.trace ?? []).filter((t) => t.type === "tool")
-              : [];
+            m.role === "assistant" ? (m.trace ?? []).filter((t) => t.type === "tool") : [];
           return (
             <div key={m.id} className={`bubble ${m.role}`}>
               <div className="text">{m.text}</div>
               {tools.length > 0 && (
-                <details className="trace">
+                <details className="trace" open>
                   <summary>
-                    what happened ({tools.length} tool call
+                    agent activity ({tools.length} tool call
                     {tools.length === 1 ? "" : "s"})
                   </summary>
                   <ol>
@@ -102,7 +149,34 @@ export default function ChatPage({
             </div>
           );
         })}
-        {busy && <div className="bubble assistant typing">Thinking… (the model runs on this Mac — a few seconds)</div>}
+
+        {live && (
+          <div className="bubble assistant live">
+            <div className="live-title">
+              <span className="pulse" />
+              thinking — round {live.round}
+            </div>
+            {live.steps.length > 0 && (
+              <ol className="live-steps">
+                {live.steps.map((s, i) => (
+                  <li key={i}>
+                    <code>{s.tool}</code>
+                    {s.args && Object.keys(s.args).length > 0 && (
+                      <span className="args">({JSON.stringify(s.args)})</span>
+                    )}{" "}
+                    →{" "}
+                    {s.status ? (
+                      <b className={s.status}>{s.status}</b>
+                    ) : (
+                      <span className="running">running…</span>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        )}
+
         {error && <div className="error inline">{error}</div>}
         <div ref={bottomRef} />
       </main>

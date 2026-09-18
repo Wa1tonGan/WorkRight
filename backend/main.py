@@ -6,9 +6,16 @@ The API surface:
   POST /auth/logout   — revoke the session
   GET  /auth/me       — who am I?
   POST /chat          — the agent's front door (session-identified)
+  POST /chat/stream   — same, but streams the agent's progress as SSE
 """
 
+import asyncio
+import json
+import queue
+import threading
+
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -106,3 +113,40 @@ def chat(request: Request, body: ChatRequest) -> dict:
     except Exception:
         return {"status": "error",
                 "reason": "agent or local model unavailable — try again"}
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
+    """Same agent, same rules — but the loop's progress streams live (SSE).
+
+    The agent runs in a worker thread (it is blocking: 2–4 local LLM calls);
+    its on_event callbacks land in a queue which this generator drains into
+    Server-Sent Events. Each event is one line: data: {...}\n\n
+    """
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401,
+                            detail="login required — POST /auth/login first")
+
+    events: queue.Queue = queue.Queue()
+
+    def worker() -> None:
+        try:
+            run_agent(body.message, identity["employee_no"],
+                      on_event=events.put)
+        except Exception:
+            events.put({"type": "error",
+                        "reason": "agent or local model unavailable"})
+        finally:
+            events.put(None)   # sentinel: stream ends
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def event_source():
+        while True:
+            event = await asyncio.to_thread(events.get)
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")

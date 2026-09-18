@@ -209,8 +209,23 @@ def _clean_answer(content: str) -> str:
     return text
 
 
-def run_agent(question: str, caller_employee_no: str) -> dict:
-    """Answer one user question via the tool loop. Returns answer + trace."""
+def run_agent(question: str, caller_employee_no: str, on_event=None) -> dict:
+    """Answer one user question via the tool loop. Returns answer + trace.
+
+    on_event (optional callable) receives LIVE progress for streaming UIs:
+      {"type": "round",        "round": n}
+      {"type": "tool_request", "round": n, "tool": name, "args": {...}}
+      {"type": "tool_result",  "round": n, "tool": name, "status": s}
+      {"type": "answer",       "answer": text, "rounds": n}
+    Best-effort: a broken listener must never break the agent.
+    """
+    def emit(event: dict) -> None:
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:
+                pass
+
     messages = [
         {"role": "system",
          "content": SYSTEM_PROMPT
@@ -221,6 +236,7 @@ def run_agent(question: str, caller_employee_no: str) -> dict:
     trace: list[dict] = []
 
     for round_no in range(1, MAX_ROUNDS + 1):
+        emit({"type": "round", "round": round_no})
         response = chat(model=MODEL, messages=messages, tools=TOOL_SPECS,
                          options={"temperature": 0})
         msg = response.message
@@ -229,6 +245,7 @@ def run_agent(question: str, caller_employee_no: str) -> dict:
         if not calls:                       # no request → this is the answer
             answer = _clean_answer(msg.content) or "(model returned nothing — escalate to HR)"
             trace.append({"round": round_no, "type": "answer"})
+            emit({"type": "answer", "answer": answer, "rounds": round_no})
             return {"answer": answer, "trace": trace, "rounds": round_no}
 
         messages.append({
@@ -242,17 +259,24 @@ def run_agent(question: str, caller_employee_no: str) -> dict:
         })
 
         for call in calls:
+            call_args = {k: v for k, v in (call.function.arguments or {}).items()}
+            emit({"type": "tool_request", "round": round_no,
+                  "tool": call.function.name, "args": call_args})
             result = _execute(call.function.name, call.function.arguments,
                               caller_employee_no)
             trace.append({"round": round_no, "type": "tool",
                            "tool": call.function.name,
-                           "args": {k: v for k, v in (call.function.arguments or {}).items()},
+                           "args": call_args,
                            "status": result.get("status")})
+            emit({"type": "tool_result", "round": round_no,
+                  "tool": call.function.name, "status": result.get("status")})
             messages.append({"role": "tool",
                               "content": json.dumps(result, default=str)})
 
     # loop exhausted: the model kept spinning — the honest shrug, not a guess
-    return {"answer": "I could not resolve this safely — escalating to HR.",
+    answer = "I could not resolve this safely — escalating to HR."
+    emit({"type": "answer", "answer": answer, "rounds": MAX_ROUNDS})
+    return {"answer": answer,
             "trace": trace, "rounds": MAX_ROUNDS}
 
 
