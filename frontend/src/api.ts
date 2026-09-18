@@ -30,6 +30,28 @@ async function errorText(res: Response): Promise<string> {
   }
 }
 
+export type PolicyChunk = {
+  chunk_id: string;
+  topic: string | null;
+  subtopic: string | null;
+  section: string | null;
+  authority: string | null;
+  jurisdiction: string[] | null;
+  text: string;
+};
+
+export type PolicyDocument = {
+  title: string;
+  source_type: string;
+  version: string;
+  authority: string | null;
+  effective_from: string | null;
+  effective_to: string | null;
+  source_url: string | null;
+  chunk_count: number;
+  chunks: PolicyChunk[];
+};
+
 export const api = {
   async me(): Promise<Identity | null> {
     const res = await fetch("/auth/me", { credentials: "include" });
@@ -47,6 +69,13 @@ export const api = {
     });
     if (!res.ok) throw new Error(await errorText(res));
     return res.json();
+  },
+
+  async policy(): Promise<PolicyDocument[]> {
+    const res = await fetch("/policy", { credentials: "include" });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()).documents;
   },
 
   async logout(): Promise<void> {

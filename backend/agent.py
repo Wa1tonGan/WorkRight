@@ -20,6 +20,7 @@ from .tools import (
     annual_leave_entitlement,
     decide_request,
     get_employee,
+    list_pending_requests,
     search_policy,
     submit_fwa_request,
     submit_leave_request,
@@ -37,6 +38,19 @@ SYSTEM_PROMPT = """You are WorkRight, an HR assistant for Malaysian employees.
 You answer questions about leave and flexible working using tools ONLY. Rules:
 - Any number, date, entitlement or personal fact must come from a tool result.
   Never invent one.
+- NEVER answer questions about company policies, rules, procedures, deadlines
+  or allowances from your own knowledge. For ANY such question you MUST call
+  search_policy FIRST and answer only from the passages it returns. If it
+  returns nothing applicable, say you cannot find it and suggest HR.
+
+Examples of correct behaviour:
+  Q: "How many annual leave days do I have?"        -> annual_leave_entitlement
+  Q: "Can I carry unused leave into next year?"     -> search_policy
+  Q: "How long do I have to submit a receipt?"      -> search_policy
+  Q: "What equipment can I claim for home office?"  -> search_policy
+  Q: "How do I apply to work from home?"            -> search_policy
+  Q: "Is my leave request approved?"                -> list_pending_requests
+Answering any of the above from memory is a FAILURE.
 - If a tool result says "escalate", "forbidden", "not_found" or
   "nothing_applicable", relay it honestly and suggest contacting HR.
 - When you rely on a policy passage, cite its id (e.g. HB-004, LAW-003).
@@ -106,6 +120,16 @@ MENU = {
                         "stage) may decide — the backend verifies and refuses "
                         "anyone else. Call this ONLY after the authorized person "
                         "has actually told you their decision.",
+    },
+    "list_pending_requests": {
+        "fn": list_pending_requests,
+        "args": {},
+        "required": [],
+        "description": "List requests awaiting a decision, scoped to YOU: "
+                        "employees see their own pending requests; managers "
+                        "see their direct reports' requests needing their "
+                        "decision; HR sees everything pending. Use this when "
+                        "asked 'any pending requests?' or before deciding one.",
     },
     "submit_fwa_request": {
         "fn": submit_fwa_request,
@@ -185,6 +209,8 @@ def _execute(name: str, args: dict, caller_employee_no: str) -> dict:
                 reason=args.get("reason"),
                 caller_employee_no=caller_employee_no,
             )
+        if name == "list_pending_requests":
+            return entry["fn"](caller_employee_no=caller_employee_no)
         if name == "submit_fwa_request":
             return entry["fn"](
                 requested_arrangement=args["requested_arrangement"],

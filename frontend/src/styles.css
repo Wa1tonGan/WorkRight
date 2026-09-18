@@ -197,3 +197,59 @@ button:disabled { opacity: 0.55; cursor: default; }
   border-top: 1px solid var(--line);
 }
 .chat-input input { flex: 1; }
+
+/* ── policy page ───────────────────────────────────────────────────── */
+
+.header-actions { display: flex; gap: 8px; }
+
+.policy-main { gap: 16px; }
+
+.doc-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.doc-head h2 { margin: 0 0 6px; font-size: 16px; letter-spacing: -0.01em; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.badge {
+  font-size: 11.5px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+.badge.type { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.badge.small { padding: 0 7px; font-size: 11px; }
+.doc-authority { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
+
+.chunks { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.chunk { border-top: 1px dashed var(--line); padding-top: 8px; }
+.chunk summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  user-select: none;
+}
+.chunk summary code {
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.chunk-topic { color: var(--muted); }
+.chunk-text {
+  margin: 8px 0 2px;
+  padding: 10px 12px;
+  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #333;
+}

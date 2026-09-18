@@ -17,11 +17,13 @@ import threading
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session as OrmSession
 
 from . import auth
 from .agent import run_agent
 from .database import engine
+from .models import PolicyChunk, PolicyDocument
 
 app = FastAPI(title="WorkRight backend")
 
@@ -150,3 +152,49 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
+
+
+@app.get("/policy")
+def policy_endpoint(request: Request) -> dict:
+    """The knowledge base, readable: documents with their chunks.
+
+    Same session requirement as /chat — who may read policy is a logged-in
+    person; nothing here is employee-private, but the door stays consistent.
+    """
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+
+    with OrmSession(engine) as session:
+        documents = []
+        for doc in session.scalars(
+            select(PolicyDocument).order_by(PolicyDocument.created_at)
+        ):
+            chunks = session.scalars(
+                select(PolicyChunk)
+                .where(PolicyChunk.document_id == doc.id)
+                .order_by(PolicyChunk.chunk_id)
+            ).all()
+            documents.append({
+                "title": doc.title,
+                "source_type": doc.source_type,
+                "version": doc.version,
+                "authority": doc.authority,
+                "effective_from": doc.effective_from.isoformat() if doc.effective_from else None,
+                "effective_to": doc.effective_to.isoformat() if doc.effective_to else None,
+                "source_url": doc.source_url,
+                "chunk_count": len(chunks),
+                "chunks": [
+                    {
+                        "chunk_id": c.chunk_id,
+                        "topic": c.topic,
+                        "subtopic": c.subtopic,
+                        "section": c.section,
+                        "authority": c.authority,
+                        "jurisdiction": c.jurisdiction,
+                        "text": c.text,
+                    }
+                    for c in chunks
+                ],
+            })
+    return {"documents": documents}

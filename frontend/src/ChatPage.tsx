@@ -20,9 +20,11 @@ let nextId = 1;
 export default function ChatPage({
   identity,
   onLogout,
+  onShowPolicy,
 }: {
   identity: Identity;
   onLogout: () => void;
+  onShowPolicy: () => void;
 }) {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -115,9 +117,14 @@ export default function ChatPage({
             {identity.employee_no}
           </div>
         </div>
-        <button className="ghost" onClick={onLogout}>
-          Sign out
-        </button>
+        <div className="header-actions">
+          <button className="ghost" onClick={onShowPolicy}>
+            Policies
+          </button>
+          <button className="ghost" onClick={onLogout}>
+            Sign out
+          </button>
+        </div>
       </header>
 
       <main className="chat-main">

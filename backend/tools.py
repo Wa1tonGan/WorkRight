@@ -818,3 +818,97 @@ def decide_request(
             "reason": reason,
             "note": note,
         }
+
+
+# ── the missing capability: finding requests that need a decision ────────────
+
+def list_pending_requests(*, caller_employee_no: str | None = None) -> dict:
+    """List requests that are AWAITING A DECISION, scoped to the caller.
+
+    Why this tool exists: without it, nobody could DISCOVER request numbers —
+    the agent could only fetch ones it was already told about. Asking
+    "any pending requests?" returned nothing because the capability simply
+    did not exist.
+
+    Scope (backend-enforced):
+      employee  → their OWN pending requests (awaiting decisions by others)
+      manager   → their direct reports' pending-manager requests (to decide)
+                  plus their own pending
+      hr/admin  → everything pending (manager and HR stages)
+    """
+    if not caller_employee_no:
+        return {"status": "rejected", "reason": "no caller identity"}
+    caller_facts = _facts(caller_employee_no)
+    if caller_facts is None:
+        return {"status": "not_found", "employee_no": caller_employee_no}
+    role = caller_facts["role"]
+
+    items: list[dict] = []
+    with Session(engine) as session:
+        caller = session.scalar(
+            select(Employee).where(Employee.employee_no == caller_employee_no)
+        )
+        pending_statuses = ("pending_manager", "pending_hr")
+
+        for req, emp in session.execute(
+            select(LeaveRequest, Employee)
+            .join(Employee, Employee.id == LeaveRequest.employee_id)
+            .where(LeaveRequest.status.in_(pending_statuses))
+        ):
+            if not (role in ("hr", "admin")
+                    or emp.id == caller.id
+                    or (role == "manager" and emp.manager_id == caller.id
+                        and req.status == "pending_manager")):
+                continue
+            portion = f" ({req.day_portion})" if req.day_portion else ""
+            items.append({
+                "request_no": req.request_no,
+                "kind": "leave",
+                "employee_no": emp.employee_no,
+                "employee_name": emp.full_name,
+                "summary": f"{req.leave_type} {req.start_date} → {req.end_date} "
+                           f"({float(req.requested_days)} days{portion})",
+                "status": req.status,
+                "submitted_at": req.submitted_at.isoformat() if req.submitted_at else None,
+            })
+
+        for req, emp in session.execute(
+            select(FlexibleWorkRequest, Employee)
+            .join(Employee, Employee.id == FlexibleWorkRequest.employee_id)
+            .where(FlexibleWorkRequest.status.in_(pending_statuses))
+        ):
+            if not (role in ("hr", "admin")
+                    or emp.id == caller.id
+                    or (role == "manager" and emp.manager_id == caller.id
+                        and req.status == "pending_manager")):
+                continue
+            dims = ", ".join(
+                name for name, flag in (("hours", req.change_hours),
+                                        ("days", req.change_days),
+                                        ("place", req.change_place)) if flag
+            )
+            items.append({
+                "request_no": req.request_no,
+                "kind": "flexible_work",
+                "employee_no": emp.employee_no,
+                "employee_name": emp.full_name,
+                "summary": f"change {dims}: {req.requested_arrangement} "
+                           f"(from {req.proposed_start_date})",
+                "status": req.status,
+                "submitted_at": req.submitted_at.isoformat() if req.submitted_at else None,
+            })
+
+    items.sort(key=lambda i: i["submitted_at"] or "")
+    scope = {"employee": "your own requests (others decide these)",
+             "manager": "your direct reports' requests needing YOUR decision, "
+                        "plus your own",
+             "hr": "everything pending",
+             "admin": "everything pending"}[role]
+    return {
+        "status": "ok",
+        "scope": scope,
+        "count": len(items),
+        "pending": items,
+        "note": ("to decide one, use decide_request with its request_no"
+                 if items else "nothing is awaiting a decision"),
+    }
