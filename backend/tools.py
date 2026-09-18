@@ -277,7 +277,8 @@ def search_chunks(
     jurisdiction=None skips the eligibility filter (demo/testing only —
     tools exposed to the agent always pass one).
     """
-    qvec = embed(model=EMBEDDING_MODEL, input=[question])["embeddings"][0]
+    qvec = embed(model=EMBEDDING_MODEL, input=[question],
+                 keep_alive="30m")["embeddings"][0]
     keys = ("chunk_id", "topic", "subtopic", "section", "source_type",
             "authority", "similarity", "text")
     with Session(engine) as session:
@@ -321,6 +322,12 @@ def search_policy(
         return {"status": "not_found", "employee_no": employee_no}
 
     results = search_chunks(question, jurisdiction=facts["jurisdiction"], k=k)
+    # Cap the text sent to the answering model: prompt processing is the main
+    # latency cost on a local 3B model, and the top passages carry the answer.
+    # The database keeps the full text; this is a context-window economy.
+    for r in results:
+        if len(r["text"]) > 1000:
+            r["text"] = r["text"][:1000] + " […truncated for context]"
     if not results:
         return {
             "status": "nothing_applicable",

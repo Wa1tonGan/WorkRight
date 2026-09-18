@@ -12,6 +12,7 @@ Run the demo:  uv run python -m backend.agent
 """
 
 import json
+import os
 
 from ollama import chat
 
@@ -24,7 +25,11 @@ from .tools import (
     submit_leave_request,
 )
 
-MODEL = "qwen3:4b"
+# Model choice is a speed/quality dial, configurable per run:
+#   qwen2.5:3b  — ~1s per round, no hidden reasoning  (default: good UX)
+#   qwen3:4b    — ~6-12s per round (thinking mode), stronger reasoning
+# Switch with:  WR_MODEL=qwen3:4b uv run uvicorn backend.main:app --port 8000
+MODEL = os.getenv("WR_MODEL", "qwen2.5:3b")
 MAX_ROUNDS = 8
 
 SYSTEM_PROMPT = """You are WorkRight, an HR assistant for Malaysian employees.
@@ -35,7 +40,8 @@ You answer questions about leave and flexible working using tools ONLY. Rules:
 - If a tool result says "escalate", "forbidden", "not_found" or
   "nothing_applicable", relay it honestly and suggest contacting HR.
 - When you rely on a policy passage, cite its id (e.g. HB-004, LAW-003).
-- Be brief and plain. You cannot approve, reject or modify anything —
+- Keep answers to 2-4 short sentences unless asked for detail. Be plain.
+- You cannot approve, reject or modify anything —
   humans do that. You MAY create a leave request (submit_leave_request) or a
   flexible-working request (submit_fwa_request) for the employee you are
   talking to; both are PENDING a human decision. Confirm details before
@@ -238,7 +244,7 @@ def run_agent(question: str, caller_employee_no: str, on_event=None) -> dict:
     for round_no in range(1, MAX_ROUNDS + 1):
         emit({"type": "round", "round": round_no})
         response = chat(model=MODEL, messages=messages, tools=TOOL_SPECS,
-                         options={"temperature": 0})
+                         options={"temperature": 0}, keep_alive="30m")
         msg = response.message
         calls = msg.tool_calls
 
