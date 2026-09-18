@@ -193,6 +193,11 @@ def policy_endpoint(request: Request) -> dict:
                         "authority": c.authority,
                         "jurisdiction": c.jurisdiction,
                         "text": c.text,
+                        # the coordinates — the 1024 numbers BGE-M3 produced
+                        # from this text (rounded for display; the DB keeps
+                        # full precision)
+                        "embedding": [round(float(x), 5) for x in c.embedding]
+                        if c.embedding is not None else None,
                     }
                     for c in chunks
                 ],

@@ -35,7 +35,7 @@ export default function PolicyPage({ onBack }: { onBack: () => void }) {
               <h2>{doc.title}</h2>
               <div className="badges">
                 <span className="badge type">{doc.source_type}</span>
-                <span className="badge">v{doc.version}</span>
+                <span className="badge">{doc.version}</span>
                 {doc.effective_from && (
                   <span className="badge">
                     in force {doc.effective_from}
@@ -56,6 +56,31 @@ export default function PolicyPage({ onBack }: { onBack: () => void }) {
                     {c.section && <span className="badge small">§{c.section}</span>}
                   </summary>
                   <pre className="chunk-text">{c.text}</pre>
+                  {c.embedding && (
+                    <details className="coords">
+                      <summary>
+                        coordinates ({c.embedding.length}-d)
+                        <span className="coord-preview">
+                          [{c.embedding.slice(0, 3).map((n) => n.toFixed(3)).join(", ")}, …]
+                        </span>
+                      </summary>
+                      <div className="coord-note">
+                        These {c.embedding.length} numbers ARE the meaning of the
+                        text above — BGE-M3's fingerprint. Search compares this
+                        vector against the question's vector; the text is only
+                        what gets quoted back.
+                      </div>
+                      <pre className="coord-text">
+                        {Array.from({ length: Math.ceil(c.embedding.length / 8) },
+                          (_, row) =>
+                            c.embedding!
+                              .slice(row * 8, row * 8 + 8)
+                              .map((n) => n.toFixed(4).padStart(9))
+                              .join(" "),
+                        ).join("\n")}
+                      </pre>
+                    </details>
+                  )}
                 </details>
               ))}
             </div>

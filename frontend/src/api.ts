@@ -38,6 +38,7 @@ export type PolicyChunk = {
   authority: string | null;
   jurisdiction: string[] | null;
   text: string;
+  embedding: number[] | null;
 };
 
 export type PolicyDocument = {
