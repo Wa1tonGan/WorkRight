@@ -53,6 +53,29 @@ export type PolicyDocument = {
   chunks: PolicyChunk[];
 };
 
+export type AuditRow = {
+  level: string;
+  approver: string;
+  decision: string;
+  reason: string | null;
+  decided_at: string;
+};
+
+export type RequestItem = {
+  request_no: string;
+  kind: "leave" | "flexible_work";
+  summary: string;
+  status: string;
+  submitted_at: string | null;
+  decided_at?: string | null;
+  decision_reason?: string | null;
+  statutory_due?: string | null;
+  company_target?: string | null;
+  employee_no?: string;
+  employee_name?: string;
+  audit: AuditRow[];
+};
+
 export const api = {
   async me(): Promise<Identity | null> {
     const res = await fetch("/auth/me", { credentials: "include" });
@@ -91,6 +114,36 @@ export const api = {
     if (res.status === 401) throw new Error("Session expired — please sign in again.");
     if (!res.ok) throw new Error(await errorText(res));
     return (await res.json()).messages;
+  },
+
+  async myRequests(): Promise<RequestItem[]> {
+    const res = await fetch("/requests", { credentials: "include" });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()).requests;
+  },
+
+  async pending(): Promise<RequestItem[]> {
+    const res = await fetch("/pending", { credentials: "include" });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()).pending;
+  },
+
+  async decide(
+    requestNo: string,
+    decision: "approved" | "rejected",
+    reason?: string,
+  ): Promise<{ status: string; new_status?: string; reason?: string; note?: string }> {
+    const res = await fetch(`/requests/${requestNo}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ decision, reason: reason ?? null }),
+    });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return res.json();
   },
 
   async logout(): Promise<void> {

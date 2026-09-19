@@ -13,6 +13,9 @@ export default defineConfig({
       "/chat": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000",
       "/policy": "http://127.0.0.1:8000",
+      "/requests": "http://127.0.0.1:8000",
+      "/pending": "http://127.0.0.1:8000",
+      "/conversations": "http://127.0.0.1:8000",
     },
   },
 });

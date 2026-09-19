@@ -29,10 +29,14 @@ export default function ChatPage({
   identity,
   onLogout,
   onShowPolicy,
+  onShowRequests,
+  onShowApprovals,
 }: {
   identity: Identity;
   onLogout: () => void;
   onShowPolicy: () => void;
+  onShowRequests: () => void;
+  onShowApprovals: () => void;
 }) {
   const greeting: Message = {
     id: nextId++,
@@ -197,6 +201,12 @@ export default function ChatPage({
               </option>
             ))}
           </select>
+          <button className="ghost" onClick={onShowRequests}>
+            My requests
+          </button>
+          <button className="ghost" onClick={onShowApprovals}>
+            Approvals
+          </button>
           <button className="ghost" onClick={onShowPolicy}>
             Policies
           </button>

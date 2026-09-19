@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session as OrmSession
 
-from . import auth, conversations
+from . import auth, conversations, request_views
 from .agent import run_agent
 from .database import engine
 from .models import PolicyChunk, PolicyDocument
@@ -254,3 +254,47 @@ def conversation_messages_endpoint(request: Request, conversation_id: str) -> di
     if messages is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     return {"conversation_id": conversation_id, "messages": messages}
+
+
+@app.get("/requests")
+def my_requests_endpoint(request: Request) -> dict:
+    """Everything this employee has ever requested, with audit trails."""
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return {"requests": request_views.my_requests(identity["employee_no"])}
+
+
+@app.get("/pending")
+def pending_endpoint(request: Request) -> dict:
+    """Items awaiting THIS caller's decision (scoping shared with the agent)."""
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return {"pending": request_views.pending_for(identity["employee_no"])}
+
+
+class DecisionRequest(BaseModel):
+    decision: str            # approved | rejected
+    reason: str | None = None
+
+
+@app.post("/requests/{request_no}/decision")
+def decision_endpoint(request: Request, request_no: str,
+                      body: DecisionRequest) -> dict:
+    """The button path — same tool, same authority checks, same audit trail.
+
+    A peer clicking Approve gets exactly what a peer typing it in chat gets:
+    forbidden. The rules do not have a UI-shaped loophole.
+    """
+    from .tools import decide_request
+
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+    result = decide_request(request_no, body.decision,
+                            caller_employee_no=identity["employee_no"],
+                            reason=body.reason)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="request not found")
+    return result

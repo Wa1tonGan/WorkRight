@@ -298,3 +298,37 @@ button:disabled { opacity: 0.55; cursor: default; }
   font-size: 12.5px;
   max-width: 200px;
 }
+
+/* request cards + status badges */
+.req-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.req-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.req-head code {
+  background: var(--accent-soft); color: var(--accent);
+  padding: 1px 7px; border-radius: 5px; font-size: 12.5px;
+}
+.badge.status { font-weight: 600; }
+.badge.status.ok { color: var(--ok); border-color: var(--ok); background: #f0fdf4; }
+.badge.status.wait { color: var(--warn); border-color: var(--warn); background: #fffbeb; }
+.badge.status.bad { color: var(--bad); border-color: var(--bad); background: #fef2f2; }
+.req-summary { margin-top: 8px; font-size: 14px; }
+.req-meta { margin-top: 4px; font-size: 12.5px; color: var(--muted); }
+.audit { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; font-size: 13px; }
+.audit summary { cursor: pointer; color: var(--muted); font-size: 12.5px; user-select: none; }
+.audit-list { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.audit-list b.ok { color: var(--ok); }
+.audit-list b.bad { color: var(--bad); }
+.audit-list .when { color: var(--muted); }
+.audit-empty { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.req-actions { margin-top: 12px; display: flex; gap: 8px; }
+.reject-box { margin-top: 12px; display: flex; gap: 8px; }
+.reject-box input { flex: 1; }
+button.danger { background: var(--bad); }
+.notice {
+  background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--ok);
+  border-radius: 8px; padding: 8px 12px; font-size: 13px;
+}
