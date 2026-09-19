@@ -241,8 +241,12 @@ def _clean_answer(content: str) -> str:
     return text
 
 
-def run_agent(question: str, caller_employee_no: str, on_event=None) -> dict:
+def run_agent(question: str, caller_employee_no: str, on_event=None,
+              history: list[dict] | None = None) -> dict:
     """Answer one user question via the tool loop. Returns answer + trace.
+
+    history (optional): prior turns [{role, content}, ...] — the conversation
+    memory, assembled by the CALLER from the database. Bounded by the caller.
 
     on_event (optional callable) receives LIVE progress for streaming UIs:
       {"type": "round",        "round": n}
@@ -263,8 +267,10 @@ def run_agent(question: str, caller_employee_no: str, on_event=None) -> dict:
          "content": SYSTEM_PROMPT
                      + f"\n\nThe employee you are currently talking to is "
                        f"{caller_employee_no}."},
-        {"role": "user", "content": question},
     ]
+    if history:
+        messages.extend(history)      # short-term memory, oldest-first
+    messages.append({"role": "user", "content": question})
     trace: list[dict] = []
 
     for round_no in range(1, MAX_ROUNDS + 1):

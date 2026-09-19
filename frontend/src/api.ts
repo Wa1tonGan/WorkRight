@@ -79,6 +79,20 @@ export const api = {
     return (await res.json()).documents;
   },
 
+  async conversations(): Promise<Conversation[]> {
+    const res = await fetch("/conversations", { credentials: "include" });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()).conversations;
+  },
+
+  async conversationMessages(id: string): Promise<StoredMessage[]> {
+    const res = await fetch(`/conversations/${id}/messages`, { credentials: "include" });
+    if (res.status === 401) throw new Error("Session expired — please sign in again.");
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()).messages;
+  },
+
   async logout(): Promise<void> {
     await fetch("/auth/logout", { method: "POST", credentials: "include" });
   },
@@ -98,7 +112,22 @@ export const api = {
 
 // ── streaming: the agent's live progress (SSE) ──────────────────────────────
 
+export type Conversation = {
+  id: string;
+  title: string | null;
+  started_at: string;
+  last_active_at: string;
+};
+
+export type StoredMessage = {
+  role: "user" | "assistant";
+  content: string;
+  trace: TraceStep[] | null;
+  created_at: string;
+};
+
 export type StreamEvent =
+  | { type: "conversation"; conversation_id: string }
   | { type: "round"; round: number }
   | { type: "tool_request"; round: number; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; round: number; tool: string; status: string }
@@ -108,12 +137,13 @@ export type StreamEvent =
 export async function chatStream(
   message: string,
   onEvent: (ev: StreamEvent) => void,
+  conversationId?: string | null,
 ): Promise<void> {
   const res = await fetch("/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, conversation_id: conversationId ?? null }),
   });
   if (res.status === 401) throw new Error("Session expired — please sign in again.");
   if (!res.ok || !res.body) throw new Error(await errorText(res));

@@ -287,3 +287,14 @@ button:disabled { opacity: 0.55; cursor: default; }
   max-height: 260px;
   overflow-y: auto;
 }
+
+/* conversation switcher */
+.conv-select {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12.5px;
+  max-width: 200px;
+}

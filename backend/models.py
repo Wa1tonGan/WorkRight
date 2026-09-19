@@ -18,7 +18,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -422,4 +422,53 @@ class Session(Base):
 
     __table_args__ = (
         Index("ix_sessions_employee", "employee_id"),
+    )
+
+
+class Conversation(Base):
+    """One chat thread, owned by one employee (the security fence).
+
+    Short-term in NATURE (it matters for a day), durable in STORAGE —
+    server restarts and page refreshes must not erase it.
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    employee_id: Mapped[str] = mapped_column(ForeignKey("employees.id"))
+    title: Mapped[str | None] = mapped_column(Text)     # first user message, trimmed
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_active_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (Index("ix_conversations_employee", "employee_id", "last_active_at"),)
+
+
+class Message(Base):
+    """One turn of a conversation. The trace column makes chats replayable:
+    what did the agent do, and what did it cite?"""
+
+    __tablename__ = "messages"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    role: Mapped[str] = mapped_column(Text)             # user | assistant
+    content: Mapped[str] = mapped_column(Text)
+    trace: Mapped[dict | None] = mapped_column(JSONB)   # tool calls, args, statuses
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="ck_message_role"),
+        Index("ix_messages_conversation", "conversation_id", "created_at"),
     )

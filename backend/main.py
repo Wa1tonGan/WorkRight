@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session as OrmSession
 
-from . import auth
+from . import auth, conversations
 from .agent import run_agent
 from .database import engine
 from .models import PolicyChunk, PolicyDocument
@@ -94,9 +94,11 @@ def me_endpoint(request: Request) -> dict:
 
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str | None = None
     # NOTE: no employee_no — identity comes from the session cookie ONLY.
-    # The old body-supplied identity was a documented V1 placeholder; the
-    # sessions table replaced it. The agent and its tools are unchanged.
+    # conversation_id (optional): continue an existing conversation; its
+    # history is loaded from the database and fed to the model. Omit to
+    # start a new one — the server creates it and returns its id.
 
 
 @app.post("/chat")
@@ -110,11 +112,25 @@ def chat(request: Request, body: ChatRequest) -> dict:
     if identity is None:
         raise HTTPException(status_code=401,
                             detail="login required — POST /auth/login first")
+
+    conversation_id = body.conversation_id
+    if conversation_id:
+        if not conversations.owns(conversation_id, identity["employee_no"]):
+            raise HTTPException(status_code=404, detail="conversation not found")
+    else:
+        conversation_id = conversations.create_conversation(identity["employee_no"])
+
+    history = conversations.history_for_prompt(conversation_id)
+    conversations.append_message(conversation_id, "user", body.message)
     try:
-        return run_agent(body.message, identity["employee_no"])
+        result = run_agent(body.message, identity["employee_no"], history=history)
     except Exception:
         return {"status": "error",
                 "reason": "agent or local model unavailable — try again"}
+    conversations.append_message(conversation_id, "assistant", result["answer"],
+                                 trace=result["trace"])
+    result["conversation_id"] = str(conversation_id)
+    return result
 
 
 @app.post("/chat/stream")
@@ -130,12 +146,25 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
         raise HTTPException(status_code=401,
                             detail="login required — POST /auth/login first")
 
+    conversation_id = body.conversation_id
+    if conversation_id:
+        if not conversations.owns(conversation_id, identity["employee_no"]):
+            raise HTTPException(status_code=404, detail="conversation not found")
+    else:
+        conversation_id = conversations.create_conversation(identity["employee_no"])
+
+    # memory: last N turns from the DATABASE, assembled before this message
+    history = conversations.history_for_prompt(conversation_id)
+    conversations.append_message(conversation_id, "user", body.message)
+
     events: queue.Queue = queue.Queue()
 
     def worker() -> None:
         try:
-            run_agent(body.message, identity["employee_no"],
-                      on_event=events.put)
+            result = run_agent(body.message, identity["employee_no"],
+                               on_event=events.put, history=history)
+            conversations.append_message(conversation_id, "assistant",
+                                         result["answer"], trace=result["trace"])
         except Exception:
             events.put({"type": "error",
                         "reason": "agent or local model unavailable"})
@@ -145,6 +174,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
     threading.Thread(target=worker, daemon=True).start()
 
     async def event_source():
+        yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': str(conversation_id)})}\n\n"
         while True:
             event = await asyncio.to_thread(events.get)
             if event is None:
@@ -203,3 +233,24 @@ def policy_endpoint(request: Request) -> dict:
                 ],
             })
     return {"documents": documents}
+
+
+@app.get("/conversations")
+def conversations_endpoint(request: Request) -> dict:
+    """This employee's recent conversations (for the chat switcher)."""
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return {"conversations": conversations.list_conversations(identity["employee_no"])}
+
+
+@app.get("/conversations/{conversation_id}/messages")
+def conversation_messages_endpoint(request: Request, conversation_id: str) -> dict:
+    """Full transcript of one conversation — 404 unless it belongs to you."""
+    identity = auth.resolve(request.cookies.get(SESSION_COOKIE))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="login required")
+    messages = conversations.messages_of(conversation_id, identity["employee_no"])
+    if messages is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"conversation_id": conversation_id, "messages": messages}

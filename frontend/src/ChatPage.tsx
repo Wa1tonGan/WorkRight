@@ -1,5 +1,12 @@
-import { useRef, useState } from "react";
-import { chatStream, type Identity, type StreamEvent, type TraceStep } from "./api";
+import { useEffect, useRef, useState } from "react";
+import {
+  api,
+  chatStream,
+  type Conversation,
+  type Identity,
+  type StreamEvent,
+  type TraceStep,
+} from "./api";
 
 type Message =
   | { id: number; role: "user"; text: string }
@@ -16,6 +23,7 @@ const SUGGESTIONS = [
 ];
 
 let nextId = 1;
+const LAST_CONVERSATION_KEY = "wr_last_conversation";
 
 export default function ChatPage({
   identity,
@@ -26,18 +34,70 @@ export default function ChatPage({
   onLogout: () => void;
   onShowPolicy: () => void;
 }) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: nextId++,
-      role: "assistant",
-      text: `Hi ${identity.name.split(" ")[0]} — ask me about your leave, or request a flexible-working arrangement. I can look things up and file requests, but humans decide.`,
-    },
-  ]);
+  const greeting: Message = {
+    id: nextId++,
+    role: "assistant",
+    text: `Hi ${identity.name.split(" ")[0]} — ask me about your leave, or request a flexible-working arrangement. I can look things up and file requests, but humans decide.`,
+  };
+  const [messages, setMessages] = useState<Message[]>([greeting]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState<Live | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // on load: refresh the conversation list, restore the last conversation
+  useEffect(() => {
+    api.conversations().then(setConversations).catch(() => {});
+    const last = localStorage.getItem(LAST_CONVERSATION_KEY);
+    if (!last) return;
+    api
+      .conversationMessages(last)
+      .then((stored) => {
+        if (stored.length === 0) return;
+        setConversationId(last);
+        setMessages([
+          greeting,
+          ...stored.map((m) =>
+            m.role === "user"
+              ? { id: nextId++, role: "user" as const, text: m.content }
+              : { id: nextId++, role: "assistant" as const, text: m.content,
+                  trace: m.trace ?? undefined },
+          ),
+        ]);
+      })
+      .catch(() => localStorage.removeItem(LAST_CONVERSATION_KEY));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function switchConversation(id: string) {
+    if (busy) return;
+    if (!id) {
+      newChat();
+      return;
+    }
+    const stored = await api.conversationMessages(id);
+    setConversationId(id);
+    localStorage.setItem(LAST_CONVERSATION_KEY, id);
+    setMessages([
+      greeting,
+      ...stored.map((m) =>
+        m.role === "user"
+          ? { id: nextId++, role: "user" as const, text: m.content }
+          : { id: nextId++, role: "assistant" as const, text: m.content,
+              trace: m.trace ?? undefined },
+      ),
+    ]);
+  }
+
+  function newChat() {
+    setConversationId(null);
+    localStorage.removeItem(LAST_CONVERSATION_KEY);
+    setMessages([{ ...greeting, id: nextId++ }]);
+    setError(null);
+  }
 
   async function send(text: string) {
     const message = text.trim();
@@ -54,6 +114,10 @@ export default function ChatPage({
 
     const onEvent = (ev: StreamEvent) => {
       switch (ev.type) {
+        case "conversation":
+          setConversationId(ev.conversation_id);
+          localStorage.setItem(LAST_CONVERSATION_KEY, ev.conversation_id);
+          break;
         case "round":
           setLive((l) => (l ? { ...l, round: ev.round } : l));
           break;
@@ -89,7 +153,7 @@ export default function ChatPage({
     };
 
     try {
-      await chatStream(message, onEvent);
+      await chatStream(message, onEvent, conversationId);
       if (streamError) throw new Error(streamError);
       if (!answerText) throw new Error("The agent did not produce an answer — try again.");
       setMessages((m) => [
@@ -103,6 +167,7 @@ export default function ChatPage({
     } finally {
       setBusy(false);
       setLive(null);
+      api.conversations().then(setConversations).catch(() => {});
       requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }));
     }
   }
@@ -118,6 +183,20 @@ export default function ChatPage({
           </div>
         </div>
         <div className="header-actions">
+          <select
+            className="conv-select"
+            value={conversationId ?? ""}
+            disabled={busy}
+            onChange={(e) => switchConversation(e.target.value)}
+            title="Your conversations"
+          >
+            <option value="">＋ New chat</option>
+            {conversations.map((c) => (
+              <option key={c.id} value={c.id}>
+                {(c.title ?? "conversation").slice(0, 40)}
+              </option>
+            ))}
+          </select>
           <button className="ghost" onClick={onShowPolicy}>
             Policies
           </button>
