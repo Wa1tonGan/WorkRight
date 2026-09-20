@@ -204,9 +204,11 @@ export default function ChatPage({
           <button className="ghost" onClick={onShowRequests}>
             My requests
           </button>
-          <button className="ghost" onClick={onShowApprovals}>
-            Approvals
-          </button>
+          {identity.role !== "employee" && (
+            <button className="ghost" onClick={onShowApprovals}>
+              Approvals
+            </button>
+          )}
           <button className="ghost" onClick={onShowPolicy}>
             Policies
           </button>

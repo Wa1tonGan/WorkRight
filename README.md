@@ -1,104 +1,145 @@
 # WorkRight
 
-A local AI-agent learning project for Malaysian HR leave and flexible working arrangements.
+A local AI agent for Malaysian HR — leave and flexible working arrangements,
+with every calculation, permission, and approval enforced by backend code and
+every answer grounded in the company's own documents.
 
-We will build WorkRight one phase at a time, explaining each component and reviewing its behaviour before moving on. The repository currently contains planning documents, a project-local Python 3.12 virtual environment with FastAPI and Uvicorn installed, and a first backend step: `backend/main.py` with a `GET /health` endpoint. No database or models have been installed by this project setup.
+Everything runs on your machine: the LLM (Qwen3 via Ollama), the embeddings
+(BGE-M3), and the database (PostgreSQL + pgvector). No paid APIs.
 
-## Project direction
+> Educational prototype with fictional employees and policies. Not an
+> official government service and not legal advice.
 
-- Run the answering LLM and embedding model locally, without paid AI APIs.
-- Use a single agent with a manually implemented tool-calling loop.
-- Store employee records, requests, saved case state, and policy vectors in one PostgreSQL database with pgvector.
-- Use fictional employees and company policies alongside verified public legal sources.
-- Keep calculations, permissions, and approvals enforced by backend code.
-- Learn RAG through small, inspectable exercises before integrating it into the full application.
+## What it can do
 
-The intended V1 scope is private-sector employment in Peninsular Malaysia and Labuan, covering annual leave, sick and hospitalisation leave, and flexible working arrangements. Unsupported cases will be referred to HR. WorkRight is an educational prototype, not an official government service or legal advice.
+- **Answer questions** from employees: leave balances, entitlements, policy
+  details, with citations to the exact policy chunk (`HB-004 §4.1`, `LAW-003 s.60E`).
+- **Book leave** — annual, sick, and hospitalisation kept as separate legal
+  categories, half-days supported, duplicates blocked by a database index.
+- **File flexible-working requests** (hours / days / place) with both deadline
+  clocks computed at submission (30-day company target, 60-day statutory).
+- **Route approvals** — managers decide for their direct reports; HR finalizes
+  the second stage of FWA and handles sick/hospitalisation. The agent can
+  never approve anything itself.
+- **Enforce access control** — employees see their own data, managers their
+  reports', HR everything. Enforced in code, not in prompts.
+- **Escalate honestly** — Sabah/Sarawak, part-time, and unsupported cases are
+  referred to HR instead of being answered with the wrong law.
+- **Keep audit trails** — every decision records who, when, and why; every
+  conversation is stored with the tool calls that produced it.
 
-## Proposed stack
+## Architecture
 
-| Part | Choice |
-| --- | --- |
-| Frontend | React, TypeScript, Vite |
-| Backend | Python, FastAPI, Pydantic |
-| Local model runner | Ollama, running directly on macOS |
-| Agent LLM | Qwen3 8B, initial evaluation candidate |
-| Embeddings | BGE-M3, initial evaluation candidate |
-| Model integration | Ollama Python library |
-| Database | PostgreSQL with pgvector |
-| Database access and migrations | SQLAlchemy and Alembic |
-| Testing | pytest and a small agent/retrieval evaluation dataset |
-| Dependency management | uv for Python, npm for frontend |
-| Database runtime | Native PostgreSQL planned; OrbStack and Docker deferred |
+```
+browser (React + Vite, :5173)
+   │  session cookie
+   ▼
+FastAPI (:8000) ── /auth /chat /chat/stream /requests /pending /policy
+   │
+   ▼
+agent loop (backend/agent.py)
+   │  the model REQUESTS tools; only this code executes them
+   ├── get_employee · annual_leave_entitlement · search_policy
+   ├── submit_leave_request · submit_fwa_request
+   ├── list_pending_requests · decide_request
+   │
+   ├──▶ PostgreSQL + pgvector — employees, requests, approvals,
+   │                            policy chunks + embeddings, conversations
+   └──▶ Ollama — qwen2.5:3b (chat) · bge-m3 (embeddings)
+```
 
-Model choices will be tested on the development Mac and on English/Malay WorkRight examples. Docker is optional. No paid inference provider is required by the planned architecture.
+Design rule throughout: **facts come from the database, decisions from code,
+sentences from the model.** The LLM interprets and speaks; it cannot compute
+balances, cannot see data without a tool, and cannot approve anything.
+
+## Quick start
+
+Prerequisites: Python 3.12 + [uv](https://docs.astral.sh/uv/),
+Node 18+, PostgreSQL 17 with pgvector, [Ollama](https://ollama.com).
+
+```sh
+# 1. backend dependencies + database schema
+uv sync
+createdb workright
+psql -d workright -c "CREATE EXTENSION IF NOT EXISTS vector;"
+uv run alembic upgrade head
+
+# 2. seed the fictional company (7 employees) + demo login passwords
+uv run python -c "import sys; sys.path.insert(0,'.'); from backend.seed import seed, set_demo_passwords; seed(); set_demo_passwords()"
+
+# 3. models (once)
+ollama pull qwen2.5:3b
+ollama pull bge-m3
+
+# 4. knowledge base: chunk + embed the policy documents
+uv run python -m backend.load_chunks
+
+# 5. run it
+uv run uvicorn backend.main:app --port 8000        # terminal 1
+cd frontend && npm install && npm run dev          # terminal 2
+```
+
+Open **http://localhost:5173** and sign in as anyone below
+(password for all: `workright123`).
+
+| Login | Who | Try |
+| --- | --- | --- |
+| `weijie.lim@example.my` | Wei Jie, employee | "how many leave days do I have left?" |
+| `siti.yusof@example.my` | Siti, manager | "any pending requests?" → Approvals page |
+| `ravi.kumar@example.my` | Ravi, HR | approve the HR stage of a WFH request |
+| `jelin.ujin@example.my` | Jelin, Sabah | ask anything — watch it escalate |
+| `danial.rahim@example.my` | Danial, new joiner | ask about a colleague's balance — refused |
+
+## Adding a new policy
+
+One command — the document is chunked on its own headings, embedded, and
+searchable immediately:
+
+```sh
+uv run python -m backend.ingest_policy knowledge/company/my_policy.md \
+    --title "Work From Home Equipment Policy" --version 1.0 \
+    --effective-from 2026-09-01
+```
+
+Only the new chunks are embedded; existing documents are untouched. A policy
+dated in the future is correctly invisible to search until it takes effect.
+
+## Testing
+
+```sh
+uv run pytest backend/ -q          # 98 tests: tools, permissions, approvals,
+                                   # balance deltas, conversations, access scoping
+uv run python -m backend.evaluate_retrieval   # retrieval eval: 8 cases + MRR
+```
+
+`docs/UI_TEST_CASES.md` has 12 executable browser scenarios with expected
+outcomes — including the refusal paths.
 
 ## Repository map
 
 ```text
-WorkRight/
-├── README.md
-├── .gitignore
-├── .python-version
-├── pyproject.toml           # Project details and direct dependencies
-├── uv.lock                  # Exact resolved dependency versions
-├── docs/
-│   ├── DEVELOPMENT_ROADMAP.md
-│   ├── RAG_LEARNING_GUIDE.md
-│   └── ORIGINAL_PROPOSAL.md
-├── backend/                 # Python application (first endpoint: backend/main.py)
-├── frontend/                # Future React interface
-├── knowledge/
-│   ├── law/                # Future verified public legal sources
-│   └── company/            # Future fictional company policies
-└── evals/                   # Future retrieval and agent evaluation cases
+backend/            FastAPI app, agent loop, tools, permissions, auth,
+                    conversations, migrations support, tests
+alembic/            8 migrations: employees → requests → approvals → FWA
+                    → auth → conversations
+frontend/           React + Vite + TypeScript UI (chat, requests, approvals,
+                    policies)
+knowledge/          the source policy documents (law corpus + handbook)
+docs/               roadmap, V1 schema design, UI test cases, RAG guide
+evals/              retrieval evaluation harness
 ```
 
-Empty folders contain `.gitkeep` placeholders so Git can track the structure. These are not application files.
+## Working agreement
 
-## Reading order
+Built one phase at a time — explain, implement, verify together, record what
+was learned. Current state and history live in
+[docs/DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md); the data model is
+in [docs/FINAL_SCHEMA_V1.sql](docs/FINAL_SCHEMA_V1.sql).
 
-1. [Development roadmap](docs/DEVELOPMENT_ROADMAP.md): phases, learning checkpoints, and current progress.
-2. [RAG learning guide](docs/RAG_LEARNING_GUIDE.md): embeddings, pgvector, tuning, evaluation, and Docker choices.
-3. [Original proposal](docs/ORIGINAL_PROPOSAL.md): an unchanged copy of the supplied project brief for reference.
+## Known limitations
 
-The original proposal recommends OpenAI APIs. Our agreed direction has since changed to local Ollama models and embeddings, as recorded here and in the roadmap. Suggestions in the original proposal do not authorize installing or implementing anything automatically.
-
-## How we will work
-
-For each phase, explain the goal and relevant concepts, implement a small step when the user is ready, inspect the result together, and record what was learned. Keep the implementation paced for learning rather than completing later phases in advance.
-
-The environment inventory is complete. A project-local `.venv` has been created with the existing Python 3.12.14 installation, and `.python-version` records the project's Python 3.12 preference. FastAPI and Uvicorn are installed, recorded in `pyproject.toml`, and resolved in `uv.lock`. OrbStack and Docker are deferred. The first health endpoint is implemented and verified (`GET /health` returns `{"status":"ok"}`); the next learning step is the PostgreSQL decision and database connection.
-
-## Using the Python environment
-
-From this repository folder, activate the environment in your terminal:
-
-```sh
-source .venv/bin/activate
-python --version
-```
-
-Activation makes this environment's Python the default for that terminal session. Other terminals and projects are unaffected. Leaving the project folder does not automatically deactivate it; run `deactivate` when finished.
-
-You can also use the environment without activation:
-
-```sh
-.venv/bin/python --version
-```
-
-The environment keeps project packages separate from global Python packages. It uses the existing base Python installation and is not a security sandbox. The `.venv/` directory is ignored by Git; `.python-version`, `pyproject.toml`, and `uv.lock` are intended to be versioned.
-
-## Understanding dependencies
-
-- `pyproject.toml` declares the project's metadata, supported Python versions, and direct dependencies. FastAPI defines API endpoints; Uvicorn runs the server that receives requests.
-- `uv.lock` records exact resolved versions, including supporting dependencies such as Pydantic and Starlette.
-- `.venv/` contains the packages actually installed for this project.
-
-We added the initial dependencies with `uv add fastapi uvicorn`. To recreate the environment from the checked-in lockfile, use:
-
-```sh
-uv sync --locked
-```
-
-This checks that the lockfile agrees with the project declaration and installs the required packages into the project environment. Downloads may be needed on a fresh machine. A separate manually maintained `requirements.txt` is unnecessary for this workflow.
+- Public holidays are not yet excluded from leave-day counting (weekends are).
+- The legal corpus is a normalized summary pending verification against the
+  official JTKSM text.
+- Carry-forward of unused leave is policy-defined but not yet computed.
+- One retrieval eval case (RAG-007, Sabah scope) currently misses `LAW-001`.
